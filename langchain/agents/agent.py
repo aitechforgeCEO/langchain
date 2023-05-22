@@ -7,17 +7,20 @@ import logging
 import time
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import yaml
 from pydantic import BaseModel, root_validator
 
+from langchain.agents.agent_types import AgentType
 from langchain.agents.tools import InvalidTool
 from langchain.base_language import BaseLanguageModel
 from langchain.callbacks.base import BaseCallbackManager
 from langchain.callbacks.manager import (
     AsyncCallbackManagerForChainRun,
+    AsyncCallbackManagerForToolRun,
     CallbackManagerForChainRun,
+    CallbackManagerForToolRun,
     Callbacks,
 )
 from langchain.chains.base import Chain
@@ -31,6 +34,7 @@ from langchain.schema import (
     AgentFinish,
     BaseMessage,
     BaseOutputParser,
+    OutputParserException,
 )
 from langchain.tools.base import BaseTool
 from langchain.utilities.asyncio import asyncio_timeout
@@ -130,7 +134,11 @@ class BaseSingleActionAgent(BaseModel):
     def dict(self, **kwargs: Any) -> Dict:
         """Return dictionary representation of agent."""
         _dict = super().dict()
-        _dict["_type"] = str(self._agent_type)
+        _type = self._agent_type
+        if isinstance(_type, AgentType):
+            _dict["_type"] = str(_type.value)
+        else:
+            _dict["_type"] = _type
         return _dict
 
     def save(self, file_path: Union[Path, str]) -> None:
@@ -305,6 +313,12 @@ class LLMSingleActionAgent(BaseSingleActionAgent):
     def input_keys(self) -> List[str]:
         return list(set(self.llm_chain.input_keys) - {"intermediate_steps"})
 
+    def dict(self, **kwargs: Any) -> Dict:
+        """Return dictionary representation of agent."""
+        _dict = super().dict()
+        del _dict["output_parser"]
+        return _dict
+
     def plan(
         self,
         intermediate_steps: List[Tuple[AgentAction, str]],
@@ -373,6 +387,12 @@ class Agent(BaseSingleActionAgent):
     llm_chain: LLMChain
     output_parser: AgentOutputParser
     allowed_tools: Optional[List[str]] = None
+
+    def dict(self, **kwargs: Any) -> Dict:
+        """Return dictionary representation of agent."""
+        _dict = super().dict()
+        del _dict["output_parser"]
+        return _dict
 
     def get_allowed_tools(self) -> Optional[List[str]]:
         return self.allowed_tools
@@ -497,11 +517,7 @@ class Agent(BaseSingleActionAgent):
     @classmethod
     def _validate_tools(cls, tools: Sequence[BaseTool]) -> None:
         """Validate that appropriate tools are passed in."""
-        for tool in tools:
-            if not tool.is_single_input:
-                raise ValueError(
-                    f"{cls.__name__} does not support multi-input tool {tool.name}."
-                )
+        pass
 
     @classmethod
     @abstractmethod
@@ -582,6 +598,25 @@ class Agent(BaseSingleActionAgent):
         }
 
 
+class ExceptionTool(BaseTool):
+    name = "_Exception"
+    description = "Exception tool"
+
+    def _run(
+        self,
+        query: str,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> str:
+        return query
+
+    async def _arun(
+        self,
+        query: str,
+        run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
+    ) -> str:
+        return query
+
+
 class AgentExecutor(Chain):
     """Consists of an agent using tools."""
 
@@ -591,6 +626,9 @@ class AgentExecutor(Chain):
     max_iterations: Optional[int] = 15
     max_execution_time: Optional[float] = None
     early_stopping_method: str = "force"
+    handle_parsing_errors: Union[
+        bool, str, Callable[[OutputParserException], str]
+    ] = False
 
     @classmethod
     def from_agent_and_tools(
@@ -719,12 +757,43 @@ class AgentExecutor(Chain):
 
         Override this to take control of how the agent makes and acts on choices.
         """
-        # Call the LLM to see what to do.
-        output = self.agent.plan(
-            intermediate_steps,
-            callbacks=run_manager.get_child() if run_manager else None,
-            **inputs,
-        )
+        try:
+            # Call the LLM to see what to do.
+            output = self.agent.plan(
+                intermediate_steps,
+                callbacks=run_manager.get_child() if run_manager else None,
+                **inputs,
+            )
+        except OutputParserException as e:
+            if isinstance(self.handle_parsing_errors, bool):
+                raise_error = not self.handle_parsing_errors
+            else:
+                raise_error = False
+            if raise_error:
+                raise e
+            text = str(e)
+            if isinstance(self.handle_parsing_errors, bool):
+                if e.send_to_llm:
+                    observation = str(e.observation)
+                    text = str(e.llm_output)
+                else:
+                    observation = "Invalid or incomplete response"
+            elif isinstance(self.handle_parsing_errors, str):
+                observation = self.handle_parsing_errors
+            elif callable(self.handle_parsing_errors):
+                observation = self.handle_parsing_errors(e)
+            else:
+                raise ValueError("Got unexpected type of `handle_parsing_errors`")
+            output = AgentAction("_Exception", observation, text)
+            tool_run_kwargs = self.agent.tool_run_logging_kwargs()
+            observation = ExceptionTool().run(
+                output.tool_input,
+                verbose=self.verbose,
+                color=None,
+                callbacks=run_manager.get_child() if run_manager else None,
+                **tool_run_kwargs,
+            )
+            return [(output, observation)]
         # If the tool chosen is the finishing tool, then we end and return.
         if isinstance(output, AgentFinish):
             return output
@@ -777,12 +846,39 @@ class AgentExecutor(Chain):
 
         Override this to take control of how the agent makes and acts on choices.
         """
-        # Call the LLM to see what to do.
-        output = await self.agent.aplan(
-            intermediate_steps,
-            callbacks=run_manager.get_child() if run_manager else None,
-            **inputs,
-        )
+        try:
+            # Call the LLM to see what to do.
+            output = await self.agent.aplan(
+                intermediate_steps,
+                callbacks=run_manager.get_child() if run_manager else None,
+                **inputs,
+            )
+        except OutputParserException as e:
+            if isinstance(self.handle_parsing_errors, bool):
+                raise_error = not self.handle_parsing_errors
+            else:
+                raise_error = False
+            if raise_error:
+                raise e
+            text = str(e)
+            if isinstance(self.handle_parsing_errors, bool):
+                observation = "Invalid or incomplete response"
+            elif isinstance(self.handle_parsing_errors, str):
+                observation = self.handle_parsing_errors
+            elif callable(self.handle_parsing_errors):
+                observation = self.handle_parsing_errors(e)
+            else:
+                raise ValueError("Got unexpected type of `handle_parsing_errors`")
+            output = AgentAction("_Exception", observation, text)
+            tool_run_kwargs = self.agent.tool_run_logging_kwargs()
+            observation = await ExceptionTool().arun(
+                output.tool_input,
+                verbose=self.verbose,
+                color=None,
+                callbacks=run_manager.get_child() if run_manager else None,
+                **tool_run_kwargs,
+            )
+            return [(output, observation)]
         # If the tool chosen is the finishing tool, then we end and return.
         if isinstance(output, AgentFinish):
             return output
@@ -870,13 +966,15 @@ class AgentExecutor(Chain):
                 # See if tool should return directly
                 tool_return = self._get_tool_return(next_step_action)
                 if tool_return is not None:
-                    return self._return(tool_return, intermediate_steps)
+                    return self._return(
+                        tool_return, intermediate_steps, run_manager=run_manager
+                    )
             iterations += 1
             time_elapsed = time.time() - start_time
         output = self.agent.return_stopped_response(
             self.early_stopping_method, intermediate_steps, **inputs
         )
-        return self._return(output, intermediate_steps)
+        return self._return(output, intermediate_steps, run_manager=run_manager)
 
     async def _acall(
         self,
@@ -907,7 +1005,11 @@ class AgentExecutor(Chain):
                         run_manager=run_manager,
                     )
                     if isinstance(next_step_output, AgentFinish):
-                        return await self._areturn(next_step_output, intermediate_steps)
+                        return await self._areturn(
+                            next_step_output,
+                            intermediate_steps,
+                            run_manager=run_manager,
+                        )
 
                     intermediate_steps.extend(next_step_output)
                     if len(next_step_output) == 1:
@@ -915,7 +1017,9 @@ class AgentExecutor(Chain):
                         # See if tool should return directly
                         tool_return = self._get_tool_return(next_step_action)
                         if tool_return is not None:
-                            return await self._areturn(tool_return, intermediate_steps)
+                            return await self._areturn(
+                                tool_return, intermediate_steps, run_manager=run_manager
+                            )
 
                     iterations += 1
                     time_elapsed = time.time() - start_time
@@ -930,7 +1034,9 @@ class AgentExecutor(Chain):
                 output = self.agent.return_stopped_response(
                     self.early_stopping_method, intermediate_steps, **inputs
                 )
-                return await self._areturn(output, intermediate_steps)
+                return await self._areturn(
+                    output, intermediate_steps, run_manager=run_manager
+                )
 
     def _get_tool_return(
         self, next_step_output: Tuple[AgentAction, str]
